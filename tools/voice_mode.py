@@ -1757,6 +1757,7 @@ def _play_audio_file_impl(file_path: str) -> bool:
 
     players.append(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_path])
     if system == "Linux":
+        players.append(["paplay", file_path])
         players.append(["aplay", "-q", file_path])
 
     for cmd in players:
