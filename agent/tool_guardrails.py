@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import deque
+import re
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Mapping
 
@@ -49,6 +50,8 @@ _STALL_GUARD_CYCLE_HISTORY = 64
 # aren't worth it, errors never are. The args preview keeps WHAT was called if compression evicts the original.
 IDENTICAL_RESULT_STUB_MIN_CHARS = 512
 _RESULT_STUB_ARGS_PREVIEW_CHARS = 120
+_ROOT_CAUSE_MAX_CHARS = 220
+_NO_PROGRESS_PREVIEW_MAX_CHARS = 220
 
 # Tools whose "failure" is normal work output (red test run, empty grep, page timeout).
 # same_tool_failure (DIFFERENT commands) never halts these; only an exact-args replay with
@@ -326,12 +329,26 @@ class ToolCallGuardrailController:
         self._call_history: deque[tuple[ToolCallSignature, str, bool]] = deque(maxlen=_STALL_GUARD_CYCLE_HISTORY)
         # tool_call_id -> spillover path, so a stub referencing a persisted-output preview can't dangle.
         self._persisted_result_paths: dict[str, str] = {}
+        self._first_failure_cause_by_signature: dict[ToolCallSignature, str] = {}
+        self._first_failure_cause_by_tool: dict[str, str] = {}
+        self._first_no_progress_preview_by_signature: dict[ToolCallSignature, str] = {}
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
+
+    def halt_root_cause(self, decision: ToolGuardrailDecision) -> str:
+        """Best-effort first root-cause summary for a halt decision."""
+        signature = decision.signature
+        if decision.code == "repeated_exact_failure_block" and signature is not None:
+            return self._first_failure_cause_by_signature.get(signature, "")
+        if decision.code == "same_tool_failure_halt":
+            return self._first_failure_cause_by_tool.get(decision.tool_name, "")
+        if decision.code in {"idempotent_no_progress_block", "identical_call_streak_halt"} and signature is not None:
+            return self._first_no_progress_preview_by_signature.get(signature, "")
+        return ""
 
     def _decide(
         self, action: str, code: str, tool_name: str, count: int, signature: ToolCallSignature,
@@ -374,6 +391,10 @@ class ToolCallGuardrailController:
         warnings = self.config.warnings_enabled
 
         if failed:
+            root_cause = _summarize_underlying_failure(result)
+            if root_cause:
+                self._first_failure_cause_by_signature.setdefault(signature, root_cause)
+                self._first_failure_cause_by_tool.setdefault(tool_name, root_cause)
             # An identical failing call is only a REPLAY if nothing landed in between;
             # a mutation since the last identical failure restarts the exact-args streak.
             if self._progress_since_failure.pop(signature, False):
@@ -419,6 +440,10 @@ class ToolCallGuardrailController:
         previous = self._no_progress.get(signature)
         repeat_count = previous[1] + 1 if previous is not None and previous[0] == result_hash else 1
         self._no_progress[signature] = (result_hash, repeat_count)
+        if repeat_count >= 2:
+            preview = _summarize_no_progress_result(result)
+            if preview:
+                self._first_no_progress_preview_by_signature.setdefault(signature, preview)
         if warnings and repeat_count >= self.config.no_progress_warn_after:
             return self._decide("warn", "idempotent_no_progress_warning", tool_name, repeat_count, signature)
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
@@ -583,6 +608,62 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
         "or a different tool that can make progress. If the blocker is external, report "
         "the blocker after one diagnostic attempt instead of repeating the same failing path."
     )
+
+
+def _summarize_underlying_failure(result: str | None) -> str:
+    """Compact first-failure cause extracted from a tool result payload."""
+    parsed = safe_json_loads(result or "")
+    error_text = _extract_error_text(parsed)
+    if not error_text and isinstance(result, str):
+        match = re.search(r'"error"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', result)
+        if match:
+            error_text = match.group(1).encode("utf-8").decode("unicode_escape")
+    if not error_text:
+        return ""
+    return _compact_single_line(error_text, _ROOT_CAUSE_MAX_CHARS)
+
+
+def _summarize_no_progress_result(result: str | None) -> str:
+    """Compact preview for a repeated no-progress result."""
+    parsed = safe_json_loads(result or "")
+    error_text = _extract_error_text(parsed)
+    if error_text:
+        return _compact_single_line(error_text, _NO_PROGRESS_PREVIEW_MAX_CHARS)
+    if isinstance(parsed, dict):
+        content_value = parsed.get("content")
+        if isinstance(content_value, str) and content_value.strip():
+            return _compact_single_line(content_value, _NO_PROGRESS_PREVIEW_MAX_CHARS)
+        if parsed:
+            return _compact_single_line(_canonical_json(parsed), _NO_PROGRESS_PREVIEW_MAX_CHARS)
+    if isinstance(parsed, list):
+        return _compact_single_line(_canonical_json(parsed), _NO_PROGRESS_PREVIEW_MAX_CHARS)
+    if isinstance(result, str):
+        return _compact_single_line(result, _NO_PROGRESS_PREVIEW_MAX_CHARS)
+    return ""
+
+
+def _extract_error_text(parsed: Any) -> str:
+    """Best-effort extraction of a human-meaningful error from tool JSON payloads."""
+    if isinstance(parsed, dict):
+        err = parsed.get("error")
+        if isinstance(err, str) and err.strip():
+            return err
+        results = parsed.get("results")
+        if isinstance(results, list):
+            for item in results:
+                if isinstance(item, dict):
+                    item_err = item.get("error")
+                    if isinstance(item_err, str) and item_err.strip():
+                        return item_err
+    return ""
+
+
+def _compact_single_line(text: str, max_chars: int) -> str:
+    """Whitespace-normalized single-line preview with bounded length."""
+    flat = " ".join((text or "").split())
+    if len(flat) <= max_chars:
+        return flat
+    return flat[: max_chars - 1] + "…"
 
 
 def _ordinal(count: int) -> str:

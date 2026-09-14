@@ -142,16 +142,35 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
     assert blocked.count == 2
 
 
+def test_halt_root_cause_uses_first_failure_for_repeated_exact_failure_block():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, exact_failure_block_after=2)
+    )
+    args = {"query": "same"}
+
+    controller.after_call("web_search", args, '{"error":"DNS timeout while fetching"}', failed=True)
+    controller.after_call("web_search", args, '{"error":"different later error"}', failed=True)
+
+    blocked = controller.before_call("web_search", args)
+    assert blocked.code == "repeated_exact_failure_block"
+    cause = controller.halt_root_cause(blocked)
+    assert "DNS timeout while fetching" in cause
+    assert "different later error" not in cause
 
 
+def test_halt_root_cause_uses_first_repeated_result_preview_for_no_progress_block():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, no_progress_block_after=2)
+    )
+    args = {"path": "/tmp/demo.txt"}
+    payload = '{"content":"same line from file"}'
 
+    controller.after_call("read_file", args, payload, failed=False)
+    controller.after_call("read_file", args, payload, failed=False)
 
-
-
-
-
-
-
+    blocked = controller.before_call("read_file", args)
+    assert blocked.code == "idempotent_no_progress_block"
+    assert "same line from file" in controller.halt_root_cause(blocked)
 
 
 def test_skill_read_tools_are_idempotent_and_block_repeated_identical_success_output():
