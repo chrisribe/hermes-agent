@@ -50,6 +50,73 @@ def _append_tool_error_results(messages, tool_calls, content_for) -> None:
         })
 
 
+def _required_args_error(tool_name: str, missing: List[str], *, parameters: Any) -> str:
+    """Tool-style error payload when required arguments are missing.
+
+    Mirrors deferred-tool validation wording so the model gets a concrete recovery
+    target instead of dispatching a guaranteed-invalid call.
+    """
+    missing_list = ", ".join(missing)
+    return (
+        f"Error: tool_call to '{tool_name}' is missing required argument(s): {missing_list}. "
+        "The tool was NOT invoked. Retry with a valid JSON object in arguments that includes the missing field(s)."
+    )
+
+
+def _missing_required_args(agent: Any, tool_name: str, parsed_args: Any) -> List[str]:
+    """Return required keys absent/blank in *parsed_args* for *tool_name* schema.
+
+    Empty-string coercion to ``{}`` helps parse malformed payloads, but for tools
+    with required fields (for example ``terminal.command``) dispatching ``{}``
+    creates deterministic failures that can loop. Catch them here and provide a
+    concrete, model-actionable error before dispatch.
+    """
+    try:
+        schema = None
+        tool_defs = getattr(agent, "tools", None)
+        if isinstance(tool_defs, list):
+            for td in tool_defs:
+                try:
+                    fn_td = td.get("function") if isinstance(td, dict) else None
+                    if isinstance(fn_td, dict) and fn_td.get("name") == tool_name:
+                        schema = td
+                        break
+                except Exception:
+                    continue
+        if schema is None:
+            from tools.registry import registry as _registry
+            schema = _registry.get_schema(tool_name)
+        if not isinstance(schema, dict):
+            return []
+        fn = schema.get("function") if schema.get("type") == "function" else schema
+        params = fn.get("parameters") if isinstance(fn, dict) else None
+        if not isinstance(params, dict):
+            return []
+        required = params.get("required")
+        if not isinstance(required, list) or not required:
+            return []
+        if not isinstance(parsed_args, dict):
+            return [name for name in required if isinstance(name, str) and name.strip()]
+
+        missing: List[str] = []
+        for name in required:
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if name not in parsed_args:
+                missing.append(name)
+                continue
+            value = parsed_args.get(name)
+            if value is None:
+                missing.append(name)
+                continue
+            if isinstance(value, str) and not value.strip():
+                missing.append(name)
+        return missing
+    except Exception:
+        logger.debug("required-args validation failed for %s", tool_name, exc_info=True)
+        return []
+
+
 def _partial_exit(agent, messages, conversation_history, api_call_count, final_response: str) -> Dict[str, Any]:
     """Terminal partial result. Prior retries or an earlier tool batch leave a tool-result
     tail; close it as interrupt aborts do so the next turn is not tool→user (#48879).
@@ -209,6 +276,50 @@ def validate_tool_calls(
         _append_tool_error_results(messages, tool_calls, _json_error_result)
         return _verdict("continue")
 
+    # Validate required arguments before dispatch. Empty/blank required fields are
+    # deterministic failures and should be surfaced immediately as tool errors.
+    missing_required: Dict[str, List[str]] = {}
+    for tc in tool_calls:
+        try:
+            parsed = json.loads(tc.function.arguments)
+        except Exception:
+            parsed = None
+        missing = _missing_required_args(agent, tc.function.name, parsed)
+        if missing:
+            missing_required[coalesce_tool_call_id(tc)] = missing
+
+    if missing_required:
+        retries = int(getattr(agent, "_invalid_required_args_retries", 0) or 0) + 1
+        setattr(agent, "_invalid_required_args_retries", retries)
+        if retries >= 3:
+            setattr(agent, "_invalid_required_args_retries", 0)
+            first = next(iter(missing_required.values()), [])
+            detail = ", ".join(first) if first else "required fields"
+            return _verdict("return", _partial_exit(
+                agent, messages, conversation_history, api_call_count,
+                f"Model repeatedly omitted required tool arguments ({detail})",
+            ))
+
+        append_message(messages, agent._build_assistant_message(assistant_message, finish_reason))
+
+        def _required_error_for(tc) -> str:
+            miss = missing_required.get(coalesce_tool_call_id(tc))
+            if not miss:
+                return "Skipped: another tool call in this response was missing required arguments."
+            # Include the full parameter schema shape in-band to maximize first-retry recovery.
+            try:
+                from tools.registry import registry as _registry
+                schema = _registry.get_schema(tc.function.name)
+                fn = schema.get("function") if isinstance(schema, dict) and schema.get("type") == "function" else schema
+                params = fn.get("parameters") if isinstance(fn, dict) else {}
+            except Exception:
+                params = {}
+            return _required_args_error(tc.function.name, miss, parameters=params)
+
+        _append_tool_error_results(messages, tool_calls, _required_error_for)
+        return _verdict("continue")
+
     # Reset retry counter on successful JSON validation
     agent._invalid_json_retries = 0
+    setattr(agent, "_invalid_required_args_retries", 0)
     return _verdict("ok")
